@@ -131,13 +131,18 @@ public:
         vertex_binding_remap = nullptr;
     }
 
-    void RegisterXfbEmulationCounterBuffer(VkBuffer buffer) {
-        xfb_emulation_counter_buffer = buffer;
-    }
+    void RegisterXfbEmulationCounterBuffer(VkBuffer buffer);
 
     [[nodiscard]] VkBuffer GetXfbEmulationCounterBuffer() const {
         return xfb_emulation_counter_buffer;
     }
+
+    [[nodiscard]] VkBuffer GetXfbEmulationCounterSnapshotBuffer() const {
+        return xfb_emulation_counter_snapshot_buffer;
+    }
+
+    /// Copy the live TF emulation counter after a draw so later query reads are not cleared away.
+    void SnapshotXfbEmulationCounter();
 
     void BindTransformFeedbackBuffer(u32 index, VkBuffer buffer, u32 offset, u32 size);
 
@@ -189,6 +194,7 @@ private:
     const Shader::RuntimeInfo* vertex_binding_remap{};
 
     VkBuffer xfb_emulation_counter_buffer{VK_NULL_HANDLE};
+    VkBuffer xfb_emulation_counter_snapshot_buffer{VK_NULL_HANDLE};
 };
 
 struct BufferCacheParams {
