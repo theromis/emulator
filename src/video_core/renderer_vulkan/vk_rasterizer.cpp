@@ -1723,37 +1723,14 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
         for (size_t index = 0; index <= last_dirty_attr; ++index) {
             const Tegra::Engines::Maxwell3D::Regs::VertexAttribute attribute{
                 regs.vertex_attrib_format[index]};
-            const u32 guest_binding{attribute.buffer};
+            const u32 binding{attribute.buffer};
             dirty[Dirty::VertexAttribute0 + index] = false;
-            dirty[Dirty::VertexBinding0 + static_cast<size_t>(guest_binding)] = true;
+            dirty[Dirty::VertexBinding0 + static_cast<size_t>(binding)] = true;
             if (!attribute.constant) {
-                if (vertex_remap && !IsVertexAttributeMapped(*vertex_remap, index)) {
-                    continue;
-                }
-                if (guest_binding >= max_vertex_bindings) {
-                    continue;
-                }
-                u32 location = static_cast<u32>(index);
-                u32 binding = guest_binding;
-                if (vertex_remap) {
-                    location = VulkanVertexLocation(*vertex_remap, index);
-                    if (location >= max_vertex_attrs) {
-                        continue;
-                    }
-                    if (!IsVertexBindingMapped(*vertex_remap, guest_binding)) {
-                        continue;
-                    }
-                    binding = VulkanVertexBinding(*vertex_remap, guest_binding);
-                    if (binding >= max_vertex_bindings) {
-                        continue;
-                    }
-                } else if (location >= max_vertex_attrs) {
-                    continue;
-                }
                 attributes.push_back({
                     .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT,
                     .pNext = nullptr,
-                    .location = location,
+                    .location = static_cast<u32>(index),
                     .binding = binding,
                     .format = MaxwellToVK::VertexFormat(device, attribute.type, attribute.size),
                     .offset = attribute.offset,
