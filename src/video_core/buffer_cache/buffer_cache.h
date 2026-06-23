@@ -23,6 +23,14 @@ BufferCache<P>::BufferCache(Tegra::MaxwellDeviceMemoryManager& device_memory_, R
     : runtime{runtime_}, device_memory{device_memory_}, memory_tracker{device_memory} {
     // Ensure the first slot is used for the null buffer
     void(slot_buffers.insert(runtime, NullBufferParams{}));
+    if constexpr (BufferCacheHasXfbStreamCounterHostBuffer<P>()) {
+        xfb_stream_counter_buffer_id =
+            slot_buffers.insert(runtime, XfbStreamCounterBufferParams{});
+        Register(xfb_stream_counter_buffer_id);
+        slot_buffers[xfb_stream_counter_buffer_id].Pick();
+        runtime.RegisterXfbEmulationCounterBuffer(
+            slot_buffers[xfb_stream_counter_buffer_id].Handle());
+    }
     gpu_modified_ranges.Clear();
     inline_buffer_id = NULL_BUFFER_ID;
 

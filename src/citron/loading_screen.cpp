@@ -46,7 +46,19 @@ LoadingScreen::LoadingScreen(QWidget* parent)
 }
 
 LoadingScreen::~LoadingScreen() {
-    loading_text_animation_timer->stop();
+    HaltTransitions();
+}
+
+void LoadingScreen::HaltTransitions() {
+    if (loading_text_animation_timer) {
+        loading_text_animation_timer->stop();
+    }
+    if (fadeout_animation) {
+        fadeout_animation->stop();
+    }
+    if (movie) {
+        movie->stop();
+    }
 }
 
 void LoadingScreen::Prepare(Loader::AppLoader& loader) {

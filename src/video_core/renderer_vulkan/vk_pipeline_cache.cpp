@@ -163,7 +163,9 @@ Shader::FragmentOutputType GetFragmentOutputType(u8 encoded_format) {
 Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> programs,
                                     const GraphicsPipelineCacheKey& key,
                                     const Shader::IR::Program& program,
-                                    const Shader::IR::Program* previous_program) {
+                                    const Shader::IR::Program* previous_program,
+                                    bool has_geometry_stage, u32 max_vertex_attributes,
+                                    u32 max_vertex_bindings) {
     Shader::RuntimeInfo info;
     if (previous_program) {
         info.previous_stage_stores = previous_program->info.stores;
@@ -206,7 +208,8 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
             }
         }
         if (max_vertex_attributes < Tegra::Engines::Maxwell3D::Regs::NumVertexAttributes) {
-            PopulateVertexLocationRemap(info, max_vertex_attributes, key.state, program.info);
+            PopulateVertexLocationRemap(info, max_vertex_attributes, max_vertex_bindings, key.state,
+                                        program.info);
             for (size_t index = 0; index < info.vertex_locations.size(); ++index) {
                 if (info.vertex_locations[index] == Shader::VERTEX_INPUT_DROPPED) {
                     info.generic_input_types[index] = Shader::AttributeType::Disabled;
@@ -637,6 +640,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         GraphicsPipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
 
+        const bool host_xfb = dynamic_features.has_transform_feedback ||
+                              dynamic_features.emulate_transform_feedback;
         if ((key.state.extended_dynamic_state != 0) !=
                 dynamic_features.has_extended_dynamic_state ||
             (key.state.extended_dynamic_state_2 != 0) !=
@@ -648,13 +653,27 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             (key.state.extended_dynamic_state_3_enables != 0) !=
                 dynamic_features.has_extended_dynamic_state_3_enables ||
             (key.state.dynamic_vertex_input != 0) != dynamic_features.has_dynamic_vertex_input ||
-            (key.state.xfb_enabled != 0 && !dynamic_features.has_transform_feedback)) {
+            (key.state.xfb_enabled != 0 && !host_xfb)) {
             // NOTE: xfb_enabled uses a unidirectional check. It encodes both a
             // device capability AND per-pipeline runtime state. We only reject
             // the pipeline if it actively requires XFB but the host device
             // does not support it
             LOG_WARNING(Render_Vulkan, "Skipping cached graphics pipeline: EDS feature mismatch");
             return;
+        }
+        {
+            const bool skip_xfb_pipeline = [&] {
+                if (key.state.xfb_enabled == 0) {
+                    return false;
+                }
+                if (!host_xfb) {
+                    return true;
+                }
+                return (key.state.xfb_emulated != 0) != dynamic_features.emulate_transform_feedback;
+            }();
+            if (skip_xfb_pipeline) {
+                return;
+            }
         }
         workers.QueueWork([this, key, envs_ = std::move(envs), &state, &callback]() mutable {
             ShaderPools pools;
@@ -800,11 +819,18 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
 
     const Shader::IR::Program* previous_stage{};
     Shader::Backend::Bindings binding;
-    for (size_t index = uses_vertex_a && uses_vertex_b ? 1 : 0;
-         index < Tegra::Engines::Maxwell3D::Regs::MaxShaderProgram; ++index) {
-        const bool is_emulated_stage =
-            layer_source_program != nullptr &&
-            index == static_cast<u32>(Tegra::Engines::Maxwell3D::Regs::ShaderType::Geometry);
+    const bool has_geometry_stage =
+        geometry_supported && key.unique_hashes[geometry_stage_index] != 0 &&
+        !programs[geometry_stage_index].is_geometry_passthrough;
+    const u32 max_vertex_attributes = device.GetMaxVertexInputAttributes();
+    const u32 max_vertex_bindings = device.GetMaxVertexInputBindings();
+    for (size_t index = uses_vertex_a && uses_vertex_b ? 1 : 0; index < Tegra::Engines::Maxwell3D::Regs::MaxShaderProgram;
+         ++index) {
+        if (index == geometry_stage_index && !geometry_supported) {
+            continue;
+        }
+        const bool is_emulated_stage = layer_source_program != nullptr &&
+                                       index == static_cast<u32>(Tegra::Engines::Maxwell3D::Regs::ShaderType::Geometry);
         if (key.unique_hashes[index] == 0 && !is_emulated_stage) {
             continue;
         }
@@ -814,7 +840,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         const size_t stage_index{index - 1};
         infos[stage_index] = &program.info;
 
-        const auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage)};
+        const auto runtime_info{
+            MakeRuntimeInfo(programs, key, program, previous_stage, has_geometry_stage,
+                            max_vertex_attributes, max_vertex_bindings)};
         ConvertLegacyToGeneric(program, runtime_info);
         std::vector<u32> code = EmitSPIRV(profile, runtime_info, program, binding);
         // Reserve space to reduce allocations during shader compilation

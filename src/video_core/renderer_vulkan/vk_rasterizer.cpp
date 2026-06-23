@@ -26,6 +26,7 @@
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
+#include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -33,6 +34,7 @@
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
+#include "video_core/renderer_vulkan/vertex_location_remap.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/shader_cache.h"
 #include "video_core/texture_cache/texture_cache_base.h"
@@ -274,7 +276,27 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     PrepareDraw(is_indexed, [this, is_indexed, instance_count] {
         const auto& draw_state = maxwell3d->draw_manager->GetDrawState();
         const u32 num_instances{instance_count};
-        const DrawParams draw_params{MakeDrawParams(draw_state, num_instances, is_indexed)};
+        DrawParams draw_params{MakeDrawParams(draw_state, num_instances, is_indexed)};
+        const bool uses_generated_quad_indices =
+            draw_state.topology == Tegra::Engines::Maxwell3D::Regs::PrimitiveTopology::Quads ||
+            draw_state.topology == Tegra::Engines::Maxwell3D::Regs::PrimitiveTopology::QuadStrip;
+        if (draw_params.is_indexed && !uses_generated_quad_indices) {
+            const auto& ib = draw_state.index_buffer;
+            const u64 start = ib.StartAddress();
+            const u64 end = ib.EndAddress();
+            const u64 index_size = std::max<u64>(ib.FormatSizeInBytes(), 1ULL);
+            const u64 index_span = end > start ? (end - start) : 0ULL;
+            const u64 max_indices = index_span / index_size;
+            if (draw_params.first_index >= max_indices) {
+                return;
+            }
+            const u64 remaining_indices = max_indices - draw_params.first_index;
+            draw_params.num_vertices =
+                static_cast<u32>(std::min<u64>(draw_params.num_vertices, remaining_indices));
+            if (draw_params.num_vertices == 0) {
+                return;
+            }
+        }
         scheduler.Record([draw_params](vk::CommandBuffer cmdbuf) {
             if (draw_params.is_indexed) {
                 cmdbuf.DrawIndexed(draw_params.num_vertices, draw_params.num_instances,
@@ -1663,6 +1685,11 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
 
     boost::container::static_vector<VkVertexInputBindingDescription2EXT, 32> bindings;
     boost::container::static_vector<VkVertexInputAttributeDescription2EXT, 32> attributes;
+    const size_t max_vertex_attrs = static_cast<size_t>(device.GetMaxVertexInputAttributes());
+    const size_t max_vertex_bindings = static_cast<size_t>(device.GetMaxVertexInputBindings());
+    const GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
+    const Shader::RuntimeInfo* vertex_remap =
+        pipeline ? &pipeline->VertexInputRemap() : nullptr;
 
     // There seems to be a bug on Nvidia's driver where updating only higher attributes ends up
     // generating dirty state. Track the highest dirty attribute and update all attributes until
@@ -1673,36 +1700,76 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
             highest_dirty_attr = index;
         }
     }
-    for (size_t index = 0; index < highest_dirty_attr; ++index) {
-        const Tegra::Engines::Maxwell3D::Regs::VertexAttribute attribute{
-            regs.vertex_attrib_format[index]};
-        const u32 binding{attribute.buffer};
-        dirty[Dirty::VertexAttribute0 + index] = false;
-        dirty[Dirty::VertexBinding0 + static_cast<size_t>(binding)] = true;
-        if (!attribute.constant) {
-            attributes.push_back({
-                .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT,
-                .pNext = nullptr,
-                .location = static_cast<u32>(index),
-                .binding = binding,
-                .format = MaxwellToVK::VertexFormat(device, attribute.type, attribute.size),
-                .offset = attribute.offset,
-            });
+    if (highest_dirty_attr && max_vertex_attrs > 0) {
+        const size_t last_dirty_attr =
+            std::min(*highest_dirty_attr, max_vertex_attrs - 1);
+        for (size_t index = 0; index <= last_dirty_attr; ++index) {
+            const Tegra::Engines::Maxwell3D::Regs::VertexAttribute attribute{
+                regs.vertex_attrib_format[index]};
+            const u32 guest_binding{attribute.buffer};
+            dirty[Dirty::VertexAttribute0 + index] = false;
+            dirty[Dirty::VertexBinding0 + static_cast<size_t>(guest_binding)] = true;
+            if (!attribute.constant) {
+                if (vertex_remap && !IsVertexAttributeMapped(*vertex_remap, index)) {
+                    continue;
+                }
+                if (guest_binding >= max_vertex_bindings) {
+                    continue;
+                }
+                u32 location = static_cast<u32>(index);
+                u32 binding = guest_binding;
+                if (vertex_remap) {
+                    location = VulkanVertexLocation(*vertex_remap, index);
+                    if (location >= max_vertex_attrs) {
+                        continue;
+                    }
+                    if (!IsVertexBindingMapped(*vertex_remap, guest_binding)) {
+                        continue;
+                    }
+                    binding = VulkanVertexBinding(*vertex_remap, guest_binding);
+                    if (binding >= max_vertex_bindings) {
+                        continue;
+                    }
+                } else if (location >= max_vertex_attrs) {
+                    continue;
+                }
+                attributes.push_back({
+                    .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT,
+                    .pNext = nullptr,
+                    .location = location,
+                    .binding = binding,
+                    .format = MaxwellToVK::VertexFormat(device, attribute.type, attribute.size),
+                    .offset = attribute.offset,
+                });
+            }
         }
     }
-    for (size_t index = 0; index < Tegra::Engines::Maxwell3D::Regs::NumVertexAttributes; ++index) {
-        if (!dirty[Dirty::VertexBinding0 + index]) {
+    for (size_t guest = 0; guest < Tegra::Engines::Maxwell3D::Regs::NumVertexArrays; ++guest) {
+        if (guest >= max_vertex_bindings) {
+            break;
+        }
+        if (!dirty[Dirty::VertexBinding0 + guest]) {
             continue;
         }
-        dirty[Dirty::VertexBinding0 + index] = false;
+        dirty[Dirty::VertexBinding0 + guest] = false;
 
-        const u32 binding{static_cast<u32>(index)};
-        const auto& input_binding{regs.vertex_streams[binding]};
-        const bool is_instanced{regs.vertex_stream_instances.IsInstancingEnabled(binding)};
+        if (vertex_remap && !IsVertexBindingMapped(*vertex_remap, static_cast<u32>(guest))) {
+            continue;
+        }
+        u32 vk_binding = static_cast<u32>(guest);
+        if (vertex_remap) {
+            vk_binding = VulkanVertexBinding(*vertex_remap, static_cast<u32>(guest));
+            if (vk_binding >= max_vertex_bindings) {
+                continue;
+            }
+        }
+        const auto& input_binding{regs.vertex_streams[guest]};
+        const bool is_instanced{regs.vertex_stream_instances.IsInstancingEnabled(
+            static_cast<u32>(guest))};
         bindings.push_back({
             .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT,
             .pNext = nullptr,
-            .binding = binding,
+            .binding = vk_binding,
             .stride = input_binding.stride,
             .inputRate = is_instanced ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX,
             .divisor = is_instanced ? input_binding.frequency : 1,
