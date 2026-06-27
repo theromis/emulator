@@ -21,5 +21,3 @@ void SetupPage::FadeIn() {
     animation->setEasingCurve(QEasingCurve::OutCubic);
     animation->start(QAbstractAnimation::DeleteWhenStopped);
 }
-
-#include "setup_wizard_page.moc"
