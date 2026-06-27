@@ -122,7 +122,7 @@ Tegra::RenderTargetFormat ViPixelFormatToRenderTargetFormat(
     Service::android::PixelFormat pixel_format) {
     switch (pixel_format) {
     case Service::android::PixelFormat::Bgra8888:
-        return Tegra::RenderTargetFormat::B8G8R8A8_UNORM;
+        return Tegra::RenderTargetFormat::X8B8G8R8_UNORM;
     case Service::android::PixelFormat::Rgb565:
         return Tegra::RenderTargetFormat::R5G6B5_UNORM;
     case Service::android::PixelFormat::Rgba8888:
@@ -1231,7 +1231,7 @@ void RasterizerVulkan::CompositeGameRtToViAtPresent(const Tegra::FramebufferConf
     dst_rt.format = ViPixelFormatToRenderTargetFormat(config.pixel_format);
     dst_rt.width = blit_width;
     dst_rt.height = blit_height;
-    dst_rt.tile_mode.is_pitch_linear = true;
+    dst_rt.tile_mode.is_pitch_linear.Assign(1);
     dst_rt.address_high = static_cast<u32>(vi_gpu >> 32);
     dst_rt.address_low = static_cast<u32>(vi_gpu);
 
